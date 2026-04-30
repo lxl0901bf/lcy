@@ -1,0 +1,1437 @@
+import sys
+import gc
+import glob
+import logging
+import os
+import re
+import json
+import warnings
+import multiprocessing as mp
+import concurrent.futures
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau, LambdaLR
+from torch_geometric.nn.conv import GATConv
+
+try:
+    from pyproj import Transformer
+except ImportError:
+    Transformer = None
+
+try:
+    import lightgbm as lgb
+except ImportError:
+    lgb = None
+
+warnings.filterwarnings("ignore")
+
+# ==========================================
+# 1. 基础配置与环境初始化模块
+# ==========================================
+def setup_logger(log_dir="./logs"):
+    os.makedirs(log_dir, exist_ok=True)
+    log_filename = datetime.now().strftime("run_%Y%m%d_%H%M%S.log")
+    logger = logging.getLogger("ST_Pipeline")
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(message)s')
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    file_handler = logging.FileHandler(os.path.join(log_dir, log_filename))
+    file_handler.setFormatter(formatter)
+
+    if not logger.handlers:
+        logger.addHandler(console_handler)
+        logger.addHandler(file_handler)
+    return logger
+
+logger = setup_logger()
+
+def set_deterministic_environment(seed: int = 42):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# ==========================================
+# 2. 数据摄取与特征工程管道
+# ==========================================
+class ExponentialMovingAverage:
+    """EMA 影子权重"""
+    def __init__(self, model, decay=0.999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone().detach()
+
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
+                self.shadow[name] = new_average.clone().detach()
+
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data
+                param.data = self.shadow[name]
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.backup
+                param.data = self.backup[name]
+        self.backup = {}
+
+    def state_dict(self): return self.shadow
+    def load_state_dict(self, state_dict): self.shadow = state_dict
+
+
+class DataIngestionPipeline:
+    def __init__(self, station_dirs: list, station_meta_path: str, era5_dir: str, modis_dir: str, himawari_dir: str, cache_dir: str = "./cache"):
+        self.station_dirs = station_dirs
+        self.station_meta_path = station_meta_path
+        self.era5_dir = era5_dir
+        self.modis_dir = modis_dir
+        self.himawari_dir = himawari_dir
+        self.cache_dir = cache_dir
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+        self.features_cache = os.path.join(cache_dir, "raw_features.npy")
+        self.targets_cache = os.path.join(cache_dir, "raw_targets.npy")
+        self.edge_index_cache = os.path.join(cache_dir, "edge_index.pt")
+        self.edge_attr_cache = os.path.join(cache_dir, "edge_attr.pt")
+
+        self.target_indices = []
+        self.physics_indices = {}
+        self.stations_meta = self._load_station_meta()
+
+        if Transformer is not None:
+            self.transformer = Transformer.from_crs(
+                "EPSG:4326", "+proj=sinu +lon_0=0 +x_0=0 +y_0=0 +R=6371007.181 +units=m +no_defs", always_xy=True
+            )
+        else:
+            self.transformer = None
+
+    def _load_station_meta(self) -> pd.DataFrame:
+        df = pd.read_csv(self.station_meta_path) if self.station_meta_path.lower().endswith('.csv') else pd.read_excel(self.station_meta_path, engine='openpyxl')
+        df = df.rename(columns={"监测点编码": "station_id", "经度": "longitude", "纬度": "latitude"})[["station_id", "latitude", "longitude"]].copy()
+        df["station_id"] = df["station_id"].astype(str).str.strip().str.upper()
+        df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
+        df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
+        df = df.dropna(subset=["latitude", "longitude"])
+        lon_min, lon_max = 113.5, 123.0
+        lat_min, lat_max = 21.5, 38.5
+        return df[(df["longitude"] >= lon_min) & (df["longitude"] <= lon_max) & (df["latitude"] >= lat_min) & (df["latitude"] <= lat_max)].reset_index(drop=True)
+
+    def build_physics_geographic_graph(self, radius_km=100.0, max_neighbors=8):
+        EARTH_RADIUS_M = 6371000.0
+        coords = self.stations_meta[["latitude", "longitude"]].values
+        if len(coords) < 2:
+            raise ValueError("站点数不足，无法构建图结构。")
+
+        from scipy.spatial import KDTree
+        lat_r = np.radians(coords[:, 0])
+        lon_r = np.radians(coords[:, 1])
+        x = EARTH_RADIUS_M * np.cos(lat_r) * np.cos(lon_r)
+        y = EARTH_RADIUS_M * np.cos(lat_r) * np.sin(lon_r)
+        z = EARTH_RADIUS_M * np.sin(lat_r)
+        xyz = np.stack([x, y, z], axis=1)
+        tree = KDTree(xyz)
+        edges_u, edges_v = [], []
+        radius_m = radius_km * 1000.0
+        for i in range(len(coords)):
+            dists, ids = tree.query(xyz[i], k=min(len(coords), max_neighbors+1), distance_upper_bound=radius_m)
+            for d, j in zip(dists, ids):
+                if i == j or j >= len(coords): continue
+                edges_u.append(i)
+                edges_v.append(j)
+
+        if not edges_u:
+            raise ValueError(f"在 {radius_km}km 阈值下，没有构建出任何边！请调大 radius_km 阈值。")
+
+        edges_u = np.array(edges_u)
+        edges_v = np.array(edges_v)
+        edge_index = torch.tensor(np.stack([edges_u, edges_v], axis=0), dtype=torch.long)
+
+        dlat = lat_r[edges_v] - lat_r[edges_u]
+        dlon = lon_r[edges_v] - lon_r[edges_u]
+        a = np.sin(dlat/2)**2 + np.cos(lat_r[edges_u]) * np.cos(lat_r[edges_v]) * np.sin(dlon/2)**2
+        dist_arr = EARTH_RADIUS_M * 2 * np.arctan2(np.sqrt(a), np.sqrt(np.clip(1-a, 0, None)))
+        norm = np.sqrt(dlat**2 + dlon**2) + 1e-8
+        edge_attr = torch.tensor(
+            np.stack([dlon/norm, dlat/norm, dist_arr], axis=1), dtype=torch.float32
+        )
+
+        torch.save(edge_index, self.edge_index_cache)
+        torch.save(edge_attr, self.edge_attr_cache)
+        logger.info(f"图结构构建完成 (KD‑Tree): 阈值 {radius_km}km, 节点 {len(coords)}, 边数 {len(edges_u)}")
+        return edge_index, edge_attr
+
+    @staticmethod
+    def _parse_one_csv(fp: str):
+        try:
+            df = pd.read_csv(fp, encoding="utf-8", low_memory=False)
+        except UnicodeDecodeError:
+            try:
+                df = pd.read_csv(fp, encoding="gbk", low_memory=False)
+            except Exception as e:
+                logger.warning(f"解析失败 {fp}: {e}")
+                return None
+        except Exception as e:
+            logger.warning(f"读取失败 {fp}: {e}")
+            return None
+
+        df.columns = [str(c).strip().lower() if str(c).strip().lower() in ['date', 'hour', 'type'] else str(c).strip().upper() for c in df.columns]
+        if not {"date", "hour", "type"}.issubset(df.columns):
+            return None
+
+        df['type'] = df['type'].astype(str).str.strip().str.upper().replace({"PM2_5": "PM2.5"})
+        df = df[df['type'].isin({"PM2.5", "PM10", "NO2", "SO2", "O3", "CO"})].copy()
+        if df.empty: return None
+
+        hour_num = pd.to_numeric(df["hour"], errors="coerce")
+        df["time"] = pd.to_datetime(df["date"].astype(str), format="%Y%m%d", errors='coerce') + pd.to_timedelta(hour_num, unit="h")
+        df = df.dropna(subset=["time"])
+
+        station_cols = [c for c in df.columns if c.lower() not in {"date", "hour", "type", "time"} and not c.lower().startswith("unnamed")]
+        if not station_cols: return None
+
+        stacked = df[['time', 'type'] + station_cols].groupby(['time', 'type']).mean().stack()
+        stacked.index.names = ['time', 'pollutant', 'station_id']
+        return stacked.unstack(level='pollutant').astype(np.float32)
+
+    def _load_station_observations(self) -> pd.DataFrame:
+        all_csv_files = [fp for d in self.station_dirs if os.path.isdir(d) for fp in glob.glob(os.path.join(d, "*.csv"))]
+        if not all_csv_files: return pd.DataFrame()
+
+        max_workers = min(os.cpu_count() or 8, 16)
+        all_frames = []
+        batch_size = 500
+        batches = [all_csv_files[i:i+batch_size] for i in range(0, len(all_csv_files), batch_size)]
+
+        for batch_files in tqdm(batches, desc="解析观测数据（分批）"):
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context('spawn')) as executor:
+                results = executor.map(self._parse_one_csv, batch_files, chunksize=10)
+                for res in results:
+                    if res is not None and not res.empty:
+                        all_frames.append(res)
+            gc.collect()
+
+        if not all_frames: return pd.DataFrame()
+        obs_df = pd.concat(all_frames).sort_index()
+        obs_df = obs_df[~obs_df.index.duplicated(keep='last')]
+        return obs_df.astype(np.float32)
+
+    def _load_era5_features(self) -> pd.DataFrame:
+        nc_files = sorted(glob.glob(os.path.join(self.era5_dir, "*.nc")))
+        if not nc_files: return pd.DataFrame()
+
+        try:
+            ds = xr.open_mfdataset(nc_files, engine="h5netcdf", combine="by_coords", parallel=False, chunks={"latitude": 10, "longitude": 10})
+        except Exception as e:
+            logger.error(f"ERA5 打开失败: {e}")
+            return pd.DataFrame()
+
+        time_coord = "valid_time" if "valid_time" in ds.coords else "time"
+        if time_coord not in ds.coords: return pd.DataFrame()
+
+        ds = ds.assign_coords({time_coord: pd.to_datetime(ds[time_coord].values) + timedelta(hours=8)})
+        required_vars = ["t2m", "d2m", "u10", "v10", "tp"]
+
+        lats = xr.DataArray(self.stations_meta["latitude"].values, dims="station")
+        lons = xr.DataArray(self.stations_meta["longitude"].values, dims="station")
+
+        years = np.unique(pd.to_datetime(ds[time_coord].values).year)
+        yearly_frames = []
+
+        for year in tqdm(years, desc="按年计算 ERA5 物理场"):
+            try:
+                sub_ds = ds[required_vars].sel({time_coord: str(year)}).sel(latitude=lats, longitude=lons, method="nearest").compute()
+                if len(sub_ds[time_coord]) == 0: continue
+
+                u_sq = sub_ds["u10"]**2 + sub_ds["v10"]**2 + 1e-4
+                t_celsius = sub_ds["t2m"] - 273.15
+                rib = (9.81 * 10.0 * (t_celsius - (t_celsius - 0.5))) / (sub_ds["t2m"] * u_sq)
+                rib = xr.where(np.isfinite(rib), rib, 0.0)
+                rib = rib.clip(-1.0, 0.19)
+                zeta = xr.where(rib > 0, rib / (1 - 5 * rib), rib)
+                zeta = zeta.clip(-2.0, 2.0)
+                phi_h = xr.where(zeta > 0, 1 + 5 * zeta, (1 - 16 * zeta)**(-0.5))
+                phi_h = phi_h.clip(0.1, 20.0)
+                u_star = np.sqrt(0.0015 * u_sq)
+                k_z = (0.4 * 10.0 * u_star) / phi_h
+                k_z = k_z.clip(0.01, 50.0)
+                k_z = xr.where(np.isfinite(k_z), k_z, 1.0)
+
+                era_np = sub_ds.assign(
+                    TEMP_C=t_celsius, DEW_C=sub_ds["d2m"] - 273.15, WIND_U=sub_ds["u10"],
+                    WIND_V=sub_ds["v10"], TP_MM=sub_ds["tp"] * 1000.0, K_Z=k_z
+                ).astype(np.float32)
+
+                sids = self.stations_meta["station_id"].astype(str).values
+                times_bj = era_np[time_coord].values
+                era5_cols = ['TEMP_C', 'DEW_C', 'WIND_U', 'WIND_V', 'TP_MM', 'K_Z']
+
+                df_year = pd.DataFrame({
+                    "time": np.repeat(times_bj, len(sids)),
+                    "station_id": np.tile(sids, len(times_bj)),
+                    **{f: era_np[f].values.ravel() for f in era5_cols}
+                }).set_index(["time", "station_id"])
+
+                yearly_frames.append(df_year)
+                del sub_ds, era_np, df_year
+                gc.collect()
+            except Exception as e:
+                logger.warning(f"ERA5 年度处理失败 {year}: {e}")
+
+        try: ds.close()
+        except Exception: pass
+        return pd.concat(yearly_frames).sort_index() if yearly_frames else pd.DataFrame()
+
+    @staticmethod
+    def _process_single_h8_static(args):
+        fp, sids, lat_indices, lon_indices = args
+        try:
+            if not os.path.exists(fp) or os.path.getsize(fp) < 10240:
+                return None
+
+            try:
+                ds = xr.open_dataset(fp, engine="h5netcdf", decode_timedelta=False, decode_coords=False)
+            except Exception:
+                try:
+                    ds = xr.open_dataset(fp, engine="netcdf4", decode_timedelta=False, decode_coords=False)
+                except Exception:
+                    ds = xr.open_dataset(fp, decode_timedelta=False, decode_coords=False)
+
+            with ds:
+                lat_idx_da = xr.DataArray(lat_indices, dims="station")
+                lon_idx_da = xr.DataArray(lon_indices, dims="station")
+                station_ds = ds[['AOT_Merged', 'AE_Merged', 'Hour']].isel(latitude=lat_idx_da, longitude=lon_idx_da).compute()
+
+                hour_val = station_ds["Hour"].values
+                try:
+                    hour_arr = np.asarray(hour_val, dtype=np.float32)
+                except Exception:
+                    hour_arr = np.full(len(sids), np.nan, dtype=np.float32)
+
+                if hour_arr.ndim == 0:
+                    hour_arr = np.full(len(sids), float(hour_arr), dtype=np.float32)
+                elif hour_arr.size == 1:
+                    hour_arr = np.full(len(sids), float(hour_arr.ravel()[0]), dtype=np.float32)
+                else:
+                    hour_arr = hour_arr.ravel().astype(np.float32)
+
+                if 'time' in ds.variables or 'time' in ds.coords:
+                    t_val = ds['time'].values if 'time' in ds.variables else ds.coords['time'].values
+                    t = pd.to_datetime(t_val[0] if getattr(t_val, 'ndim', 0) > 0 else t_val) + pd.Timedelta(hours=8)
+                else:
+                    return None
+
+                aot = station_ds["AOT_Merged"].values.ravel().astype(np.float32)
+                ae = station_ds["AE_Merged"].values.ravel().astype(np.float32)
+
+                n = len(sids)
+                if hour_arr.size != n: hour_arr = np.full(n, hour_arr[0] if hour_arr.size > 0 else np.nan, dtype=np.float32)
+                if aot.size != n: aot = np.full(n, np.nan, dtype=np.float32)
+                if ae.size != n: ae = np.full(n, np.nan, dtype=np.float32)
+
+                return pd.DataFrame({"time": np.repeat(t, len(sids)), "station_id": sids, "H8_AOT_Merged": aot, "H8_AE_Merged": ae, "H8_Hour_Float": hour_arr})
+        except Exception as e:
+            logger.warning(f"Himawari 解析失败 {fp}: {e}")
+            return None
+
+    def _load_himawari_features(self) -> pd.DataFrame:
+        nc_files = []
+        for root, dirs, files in os.walk(self.himawari_dir, followlinks=True):
+            dirs[:] = [d for d in dirs if d.lower() not in ['daily', 'monthly']]
+            for file in files:
+                if file.lower().endswith('.nc') or file.lower().endswith('.nc4'):
+                    nc_files.append(os.path.join(root, file))
+        nc_files = sorted(nc_files)
+        if not nc_files: return pd.DataFrame()
+
+        try:
+            with xr.open_dataset(nc_files[0], engine="h5netcdf", decode_timedelta=False) as ds:
+                h8_lats, h8_lons = ds.latitude.values, ds.longitude.values
+        except Exception as e:
+            logger.error(f"Himawari 格点读取失败: {e}")
+            return pd.DataFrame()
+
+        lat_indices = [np.abs(h8_lats - lat).argmin() for lat in self.stations_meta["latitude"].values]
+        lon_indices = [np.abs(h8_lons - lon).argmin() for lon in self.stations_meta["longitude"].values]
+        sids = self.stations_meta["station_id"].astype(str).values
+
+        task_args = [(fp, sids, lat_indices, lon_indices) for fp in nc_files]
+        merged_dfs = []
+        chunk_size = 500
+        max_workers = min(os.cpu_count() or 8, 20)
+
+        for i in tqdm(range(0, len(task_args), chunk_size), desc="解析葵花8号 (分块)"):
+            batch = task_args[i:i+chunk_size]
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+                results = executor.map(self._process_single_h8_static, batch, chunksize=10)
+                batch_dfs = []
+                for res in results:
+                    if res is not None and not res.empty:
+                        batch_dfs.append(res)
+                if batch_dfs:
+                    merged_dfs.append(pd.concat(batch_dfs).astype(np.float32))
+                    gc.collect()
+
+        if not merged_dfs: return pd.DataFrame()
+        return pd.concat(merged_dfs).set_index(["time", "station_id"]).sort_index()
+
+    @staticmethod
+    def _parse_one_modis_hdf(args):
+        fp, station_info = args
+        records = []
+        try:
+            from pyhdf.SD import SD, SDC
+            hdf = SD(fp, SDC.READ)
+
+            attr_dict = hdf.attributes()
+            orbit_times_str = attr_dict.get('Orbit_time_stamp', '')
+            matches = re.findall(r'(\d{11})[A-Za-z]?', orbit_times_str)
+            timestamps_bjt = []
+            for t_str in matches:
+                dt_utc = datetime.strptime(t_str, "%Y%j%H%M")
+                dt_bjt = dt_utc + timedelta(hours=8)
+                if dt_bjt.minute > 0 or dt_bjt.second > 0:
+                    dt_bjt_hourly = dt_bjt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+                else:
+                    dt_bjt_hourly = dt_bjt
+                timestamps_bjt.append(dt_bjt_hourly)
+
+            sids = station_info['sids']
+            rows = station_info['rows']
+            cols = station_info['cols']
+
+            sds_047 = hdf.select('Optical_Depth_047')
+            aod_047_data = sds_047.get().astype(np.float32)
+            sds_047.endaccess()
+
+            sds_055 = hdf.select('Optical_Depth_055')
+            aod_055_data = sds_055.get().astype(np.float32)
+            sds_055.endaccess()
+
+            sds_qa = hdf.select('AOD_QA')
+            qa_data = sds_qa.get().astype(np.uint16)
+            sds_qa.endaccess()
+            hdf.end()
+
+            is_clear = (qa_data & 7) == 1
+            aod_047_data = np.where((aod_047_data > 0) & is_clear, aod_047_data * 0.001, np.nan)
+            aod_055_data = np.where((aod_055_data > 0) & is_clear, aod_055_data * 0.001, np.nan)
+
+            num_orbits = min(len(timestamps_bjt), aod_047_data.shape[0])
+            for orbit_idx in range(num_orbits):
+                current_time = timestamps_bjt[orbit_idx]
+                val_047 = aod_047_data[orbit_idx, rows, cols]
+                val_055 = aod_055_data[orbit_idx, rows, cols]
+                for sid, v047, v055 in zip(sids, val_047, val_055):
+                    if not np.isnan(v047) or not np.isnan(v055):
+                        records.append((current_time, sid, v047, v055))
+            if not records: return pd.DataFrame()
+            df = pd.DataFrame(records, columns=['time', 'station_id', 'AOD_047', 'AOD_055'])
+            return df.groupby(['time', 'station_id']).mean().reset_index()
+        except Exception as e:
+            logger.warning(f"MODIS 解析失败 {fp}: {e}")
+            return pd.DataFrame()
+
+    def _load_modis_features(self) -> pd.DataFrame:
+        if self.transformer is None: return pd.DataFrame()
+        hdf_files = sorted(glob.glob(os.path.join(self.modis_dir, "**/*.hdf"), recursive=True))
+        if not hdf_files: return pd.DataFrame()
+
+        sids = self.stations_meta['station_id'].values
+        lons = self.stations_meta['longitude'].values
+        lats = self.stations_meta['latitude'].values
+        sinu_x, sinu_y = self.transformer.transform(lons, lats)
+
+        TILE_SIZE, PIXEL_SIZE = 1111950.5196666666, 1111950.5196666666 / 1200.0
+        req_h = np.floor((sinu_x + 20015109.354) / TILE_SIZE).astype(int)
+        req_v = np.floor((10007554.677 - sinu_y) / TILE_SIZE).astype(int)
+
+        tile_to_stations = {}
+        for h, v in set(zip(req_h, req_v)):
+            mask = (req_h == h) & (req_v == v)
+            if not mask.any(): continue
+            cols = np.floor((sinu_x[mask] - (h * TILE_SIZE - 20015109.354)) / PIXEL_SIZE).astype(int)
+            rows = np.floor(((10007554.677 - v * TILE_SIZE) - sinu_y[mask]) / PIXEL_SIZE).astype(int)
+            valid_p = (cols >= 0) & (cols < 1200) & (rows >= 0) & (rows < 1200)
+            tile_to_stations[f"h{h:02d}v{v:02d}"] = {
+                'sids': sids[mask][valid_p],
+                'rows': rows[valid_p],
+                'cols': cols[valid_p]
+            }
+
+        tasks = [(fp, tile_to_stations[m.group(0)]) for fp in hdf_files if (m := re.search(r'h(\d{2})v(\d{2})', os.path.basename(fp))) and m.group(0) in tile_to_stations]
+        if not tasks: return pd.DataFrame()
+
+        dfs = []
+        worker_count = min(os.cpu_count() or 4, 8)
+        for i in tqdm(range(0, len(tasks), 100), desc="MODIS 提取（分批）"):
+            batch = tasks[i:i+100]
+            with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count, mp_context=mp.get_context('spawn')) as executor:
+                futures = {executor.submit(self.__class__._parse_one_modis_hdf, t): t for t in batch}
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        res_df = future.result()
+                        if not res_df.empty: dfs.append(res_df)
+                    except Exception as e:
+                        logger.warning(f"MODIS 任务失败: {e}")
+
+        if not dfs: return pd.DataFrame()
+        modis_df = pd.concat(dfs, ignore_index=True)
+        return modis_df.groupby(['time', 'station_id']).mean().reset_index().set_index(['time', 'station_id']).astype(np.float32)
+
+    def process_and_cache(self, target_cols: list):
+        meta_cache_path = os.path.join(self.cache_dir, "feature_meta.json")
+
+        if os.path.exists(self.features_cache) and os.path.exists(self.targets_cache) and os.path.exists(meta_cache_path):
+            with open(meta_cache_path, 'r') as f: feature_cols = json.load(f)
+            self.target_indices = [feature_cols.index(tc) for tc in target_cols]
+            self.physics_indices = {
+                'u': feature_cols.index('WIND_U'),
+                'v': feature_cols.index('WIND_V'),
+                'k': feature_cols.index('K_Z')
+            }
+            return
+
+        full_df = self._load_station_observations()
+        if full_df.empty: raise RuntimeError("站点观测数据为空，无法继续。")
+
+        era5_df = self._load_era5_features()
+        if not era5_df.empty: full_df = full_df.join(era5_df, how="left")
+
+        himawari_df = self._load_himawari_features()
+        if not himawari_df.empty: full_df = full_df.join(himawari_df, how="left")
+
+        modis_df = self._load_modis_features()
+        if not modis_df.empty: full_df = full_df.join(modis_df, how="left")
+
+        min_time, max_time = full_df.index.get_level_values("time").min(), full_df.index.get_level_values("time").max()
+        continuous_times = pd.date_range(start=min_time, end=max_time, freq='h')
+
+        valid_stations = np.sort(np.intersect1d(full_df.index.get_level_values("station_id").unique().astype(str), self.stations_meta["station_id"].astype(str).values))
+        if len(valid_stations) == 0: raise RuntimeError("没有有效站点可用于训练。")
+
+        self.stations_meta = self.stations_meta.set_index("station_id").loc[valid_stations].reset_index()
+        full_idx = pd.MultiIndex.from_product([continuous_times, valid_stations], names=["time", "station_id"])
+        full_df = full_df.reindex(full_idx)
+
+        float64_cols = full_df.select_dtypes(include=['float64']).columns
+        if len(float64_cols) > 0: full_df[float64_cols] = full_df[float64_cols].astype(np.float32)
+
+        cols_to_ffill = target_cols + ['TEMP_C', 'DEW_C', 'WIND_U', 'WIND_V', 'TP_MM', 'K_Z']
+        available_cols_to_ffill = [c for c in cols_to_ffill if c in full_df.columns]
+        if available_cols_to_ffill:
+            full_df[available_cols_to_ffill] = full_df.groupby(level="station_id")[available_cols_to_ffill].transform(lambda x: x.ffill(limit=3))
+
+        temp_df = full_df.reset_index()
+
+        temp_df['TIME_MONTH'] = temp_df['time'].dt.month
+        temp_df['TIME_HOUR'] = temp_df['time'].dt.hour
+        temp_df['DOY'] = temp_df['time'].dt.dayofyear
+        temp_df['TIME_DOY_SIN'] = np.sin(2 * np.pi * temp_df['DOY'] / 365.25).astype(np.float32)
+        temp_df['TIME_DOY_COS'] = np.cos(2 * np.pi * temp_df['DOY'] / 365.25).astype(np.float32)
+        temp_df['TIME_MONTH_SIN'] = np.sin(2 * np.pi * temp_df['TIME_MONTH'] / 12.0).astype(np.float32)
+        temp_df['TIME_MONTH_COS'] = np.cos(2 * np.pi * temp_df['TIME_MONTH'] / 12.0).astype(np.float32)
+        temp_df = temp_df.drop(columns=['DOY'])
+
+        aod_columns_to_impute = ['H8_AOT_Merged', 'H8_AE_Merged', 'AOD_047', 'AOD_055']
+        tree_features = [c for c in temp_df.columns if c not in aod_columns_to_impute + ['time', 'station_id']]
+
+        train_end_idx = int(len(continuous_times) * 0.7)
+        train_cutoff_date = continuous_times[train_end_idx]
+
+        if lgb is not None:
+            for aod_col in aod_columns_to_impute:
+                if aod_col not in temp_df.columns: continue
+                train_mask = temp_df[aod_col].notnull() & (temp_df['time'] < train_cutoff_date)
+                if train_mask.sum() > 100:
+                    train_indices = temp_df[train_mask].index
+                    if len(train_indices) > 1000000:
+                        train_indices = np.random.choice(train_indices, size=1000000, replace=False)
+                    X_train = temp_df.loc[train_indices, tree_features]
+                    y_train = temp_df.loc[train_indices, aod_col]
+                    lgb_model = lgb.LGBMRegressor(n_estimators=100, random_state=42, n_jobs=-1, verbose=-1)
+                    lgb_model.fit(X_train, y_train)
+                    pred_mask = temp_df[aod_col].isnull()
+                    if pred_mask.sum() > 0:
+                        temp_df.loc[pred_mask, aod_col] = lgb_model.predict(temp_df.loc[pred_mask, tree_features]).astype(np.float32)
+                    del lgb_model, X_train, y_train, train_indices
+                    gc.collect()
+
+        temp_df = temp_df.set_index(['time', 'station_id'])
+        for col in aod_columns_to_impute:
+            if col in temp_df.columns: full_df[col] = temp_df[col]
+
+        time_encode_cols = ['TIME_MONTH', 'TIME_HOUR', 'TIME_DOY_SIN', 'TIME_DOY_COS', 'TIME_MONTH_SIN', 'TIME_MONTH_COS']
+        for col in time_encode_cols:
+            if col in temp_df.columns:
+                full_df[col] = temp_df[col]
+
+        meteorological_cols = ['TEMP_C', 'DEW_C', 'WIND_U', 'WIND_V', 'TP_MM', 'K_Z']
+        for col in meteorological_cols:
+            if col in full_df.columns:
+                full_df[col] = full_df.groupby(level='station_id')[col].transform(lambda x: x.interpolate(limit_direction='both', limit=6))
+
+        other_cols = [c for c in full_df.columns if c not in meteorological_cols + target_cols]
+        mean_vals = full_df[other_cols].mean()
+        full_df[other_cols] = full_df[other_cols].fillna(mean_vals).fillna(0.0)
+
+        for tc in target_cols:
+            if tc in full_df.columns:
+                full_df[tc] = full_df[tc].fillna(0.0).clip(lower=0.0)
+
+        for mc in meteorological_cols:
+            if mc in full_df.columns:
+                col_mean = full_df[mc].mean()
+                if not np.isfinite(col_mean):
+                    col_mean = 0.0
+                full_df[mc] = full_df[mc].fillna(col_mean).fillna(0.0)
+
+        if 'latitude' in full_df.columns: full_df = full_df.drop(columns=['latitude', 'longitude'], errors="ignore")
+
+        feature_cols = target_cols + [c for c in full_df.columns if c not in target_cols]
+
+        raw_matrix = full_df[feature_cols].to_numpy(dtype=np.float32).reshape(
+            len(continuous_times), len(valid_stations), len(feature_cols)
+        )
+
+        nan_count = np.isnan(raw_matrix).sum()
+        inf_count = np.isinf(raw_matrix).sum()
+        if nan_count > 0 or inf_count > 0:
+            logger.warning(f"raw_matrix 残余异常值: NaN={nan_count}, Inf={inf_count}, 已用 0 填充")
+            raw_matrix = np.nan_to_num(raw_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+
+        self.target_indices = [feature_cols.index(tc) for tc in target_cols]
+        self.physics_indices = {
+            'u': feature_cols.index('WIND_U'),
+            'v': feature_cols.index('WIND_V'),
+            'k': feature_cols.index('K_Z')
+        }
+
+        np.save(self.features_cache, raw_matrix)
+        np.save(self.targets_cache, raw_matrix[:, :, self.target_indices])
+        with open(meta_cache_path, 'w') as f: json.dump(feature_cols, f)
+        logger.info("数据缓存及特征工程完成。")
+
+
+# ==========================================
+# 3. 数据集与模型架构
+# ==========================================
+class LocalDiskDataset(Dataset):
+    """归一化在 __getitem__ 中完成；返回 raw_last_x 供物理惩罚使用"""
+    def __init__(self, features, targets, seq_len, pred_len,
+                 global_mu, global_std, start_idx=0, end_idx=None,
+                 norm_clip=10.0):
+        self.features = features
+        self.targets  = targets
+        self.seq_len  = seq_len
+        self.pred_len = pred_len
+        self.start_idx = start_idx
+        self.end_idx   = end_idx if end_idx is not None else features.shape[0]
+        self.valid_steps = max(0, (self.end_idx - self.start_idx) - self.seq_len - self.pred_len + 1)
+        self.norm_clip = float(norm_clip)
+
+        self.mu  = torch.as_tensor(global_mu,  dtype=torch.float32)
+        self.std = torch.as_tensor(global_std, dtype=torch.float32)
+
+        target_dim = targets.shape[-1]
+        self.target_mu  = self.mu[:,  :target_dim]
+        self.target_std = self.std[:, :target_dim]
+
+        assert self.mu.shape == (features.shape[1], features.shape[2]), \
+            f"mu shape 应为 ({features.shape[1]}, {features.shape[2]})，实际为 {self.mu.shape}"
+        assert self.std.shape == self.mu.shape, \
+            f"std shape {self.std.shape} 与 mu {self.mu.shape} 不一致"
+
+    def __len__(self):
+        return self.valid_steps
+
+    def __getitem__(self, idx):
+        actual_idx = self.start_idx + idx
+
+        raw_x = torch.as_tensor(
+            self.features[actual_idx: actual_idx + self.seq_len],
+            dtype=torch.float32
+        )
+
+        raw_y = torch.as_tensor(
+            self.targets[actual_idx + self.seq_len: actual_idx + self.seq_len + self.pred_len],
+            dtype=torch.float32
+        )
+
+        raw_x = torch.nan_to_num(raw_x, nan=0.0, posinf=0.0, neginf=0.0)
+        raw_y = torch.nan_to_num(raw_y, nan=0.0, posinf=0.0, neginf=0.0)
+
+        X_norm = (raw_x - self.mu)  / self.std
+        Y_norm = (raw_y - self.target_mu) / self.target_std
+
+        X_norm = torch.clamp(X_norm, -self.norm_clip, self.norm_clip)
+        Y_norm = torch.clamp(Y_norm, -self.norm_clip, self.norm_clip)
+        X_norm = torch.nan_to_num(X_norm, nan=0.0, posinf=0.0, neginf=0.0)
+        Y_norm = torch.nan_to_num(Y_norm, nan=0.0, posinf=0.0, neginf=0.0)
+
+        raw_last_x = raw_x[-1]
+
+        return X_norm, Y_norm, self.target_mu, self.target_std, raw_last_x
+
+
+# ==========================================
+# 监督式 Iterative Refinement 模块（替代 PPO Agent）
+# ==========================================
+class RefinementBlock(nn.Module):
+    """
+    监督式迭代细化模块（替代原 PPO_Agent）
+    输入: context 编码 + 当前预测轨迹
+    输出: 对当前轨迹的残差修正
+    """
+    def __init__(self, d_model: int, target_dim: int, max_delta: float = 0.3):
+        super().__init__()
+        self.max_delta = float(max_delta)
+        self.state_encoder = nn.Sequential(
+            nn.Linear(d_model + target_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model)
+        )
+        self.delta_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model, target_dim)
+        )
+        self.gate = nn.Sequential(
+            nn.Linear(d_model, target_dim),
+            nn.Sigmoid()
+        )
+
+    def forward(self, context_emb, current_trajectory):
+        s = self.state_encoder(torch.cat([context_emb, current_trajectory], dim=-1))
+        delta = torch.tanh(self.delta_head(s)) * self.max_delta
+        gate = self.gate(s)
+        return delta * gate
+
+
+class ST_GCN_iTransformer(nn.Module):
+    """
+    时空预测模型 (iTransformer 风格)
+
+    架构:
+    1. 输入投影 + TCN 局部时序卷积
+    2. GAT 空间消息传递（带风向边特征）
+    3. ⭐ iTransformer 风格的时间嵌入（Linear 投影,取代 Conv 时间压缩器）
+    4. Transformer Encoder 站点间交互
+    5. 基础预测头 + 多步监督式迭代细化
+    """
+    def __init__(self, num_nodes, in_features, seq_len, pred_len, out_channels,
+                 physics_indices, d_model=192, n_heads=8, num_layers=4,
+                 dropout=0.3, refinement_steps=3,
+                 time_embedding_hidden_mult=2):
+        super().__init__()
+        self.refinement_steps = int(refinement_steps)
+        self.d_model = int(d_model)
+        self.pred_len = int(pred_len)
+        self.out_channels = int(out_channels)
+        self.target_dim = int(self.pred_len * self.out_channels)
+        self.num_nodes = int(num_nodes)
+        self.seq_len = int(seq_len)
+        self.physics_indices = physics_indices
+
+        self.input_proj = nn.Linear(in_features, d_model)
+        self.tcn = nn.Conv1d(in_channels=d_model, out_channels=d_model, kernel_size=3, padding=1)
+        self.gat = GATConv(d_model, d_model // n_heads, heads=n_heads,
+                           concat=True, dropout=dropout, edge_dim=4)
+        self.gcn_norm = nn.LayerNorm(d_model)
+
+        # ⭐ iTransformer 风格的时间嵌入
+        # 每个 d_model 通道的时序整条 (T 步) 通过 Linear 直接投影成单值
+        # 取代原来的 time_compressor (3×Conv1d + AvgPool) 和 time_projector (MLP)
+        # 输入:  (..., T)        T = seq_len = 336
+        # 输出:  (..., 1)         压缩成 1 个数值
+        # 用稍带瓶颈的 MLP 替代纯 Linear,提升表达力但保留全局感受野
+        hidden = int(seq_len * time_embedding_hidden_mult)
+        self.time_embedding = nn.Sequential(
+            nn.Linear(seq_len, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1)
+        )
+
+        # Transformer 在站点维度做 attention（iTransformer 核心思想）
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 4,
+                dropout=dropout, activation='gelu', batch_first=True, norm_first=True
+            ),
+            num_layers=num_layers, enable_nested_tensor=False
+        )
+
+        # 基础预测头
+        self.base_predictor = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, self.target_dim)
+        )
+
+        # 监督式迭代细化模块
+        self.refinement_blocks = nn.ModuleList([
+            RefinementBlock(d_model, self.target_dim, max_delta=0.3)
+            for _ in range(self.refinement_steps)
+        ])
+
+    def _encode_context(self, x, edge_index, edge_attr_static):
+        """提取 (B, N, d_model) 的上下文编码"""
+        B, T, N, _ = x.shape
+        u_raw = x[..., self.physics_indices['u']].reshape(B * T, N)
+        v_raw = x[..., self.physics_indices['v']].reshape(B * T, N)
+
+        x_emb = self.input_proj(x)
+        x_local = F.gelu(
+            self.tcn(x_emb.permute(0, 2, 3, 1).reshape(B * N, self.d_model, T))
+        ).reshape(B, N, self.d_model, T).permute(0, 3, 1, 2).contiguous() + x_emb
+        x_flat = x_local.reshape(B * T, N, self.d_model)
+
+        E = edge_index.shape[1]
+        chunk_size = 32
+        padded_len = B * T + ((chunk_size - (B * T) % chunk_size) if (B * T) % chunk_size != 0 else 0)
+
+        if padded_len > B * T:
+            x_flat_padded = torch.cat(
+                [x_flat, torch.zeros(padded_len - B * T, N, self.d_model, device=x.device)], dim=0
+            )
+            u_raw_padded = torch.cat(
+                [u_raw, torch.zeros(padded_len - B * T, N, device=x.device)], dim=0
+            )
+            v_raw_padded = torch.cat(
+                [v_raw, torch.zeros(padded_len - B * T, N, device=x.device)], dim=0
+            )
+        else:
+            x_flat_padded, u_raw_padded, v_raw_padded = x_flat, u_raw, v_raw
+
+        h_spatial_list = []
+        offsets = (torch.arange(chunk_size, device=x.device) * N).repeat_interleave(E).unsqueeze(0)
+        edge_index_chunk_base = edge_index.repeat(1, chunk_size) + offsets
+
+        for i in range(0, padded_len, chunk_size):
+            u_chunk = u_raw_padded[i: i + chunk_size]
+            v_chunk = v_raw_padded[i: i + chunk_size]
+
+            u_t_all = u_chunk[:, edge_index[0]]
+            v_t_all = v_chunk[:, edge_index[0]]
+            dx = edge_attr_static[:, 0]
+            dy = edge_attr_static[:, 1]
+            wind_proj_all = u_t_all * dx + v_t_all * dy
+
+            dist_log = torch.log1p(edge_attr_static[:, 2:3])
+            norm_dist = dist_log / 10.0
+            static_part = torch.cat([edge_attr_static[:, 0:2], norm_dist], dim=-1)
+            static_part_expanded = static_part.unsqueeze(0).expand(chunk_size, E, 3)
+            batch_edge_attr_3d = torch.cat([static_part_expanded, wind_proj_all.unsqueeze(-1)], dim=-1)
+            batch_edge_attr = batch_edge_attr_3d.reshape(chunk_size * E, 4)
+
+            out_gat = self.gat(
+                x_flat_padded[i: i + chunk_size].reshape(chunk_size * N, self.d_model),
+                edge_index_chunk_base,
+                edge_attr=batch_edge_attr
+            )
+            h_spatial_list.append(out_gat)
+
+        h_spatial_cat = torch.cat(h_spatial_list, dim=0)[:B * T * N]
+        h_spatial = F.elu(self.gcn_norm(h_spatial_cat)).reshape(B, T, N, self.d_model)
+        # h_spatial shape: (B, T, N, d_model)
+
+        # ⭐ iTransformer 风格时间嵌入
+        # 重排到 (B, N, d_model, T)，让 T 成为最后一维便于 Linear 投影
+        h_spatial_rearranged = h_spatial.permute(0, 2, 3, 1).contiguous()  # (B, N, d_model, T)
+
+        # Linear(T → 1)：每个 d_model 通道的整条时序压缩成 1 个值
+        # 这一步等价于学到 T 个权重对时间步加权求和，全局感受野
+        time_feat = self.time_embedding(h_spatial_rearranged).squeeze(-1)  # (B, N, d_model)
+
+        # Transformer 在 N（站点）维度做 self-attention，符合 iTransformer 哲学
+        context_enc = self.transformer(time_feat)  # (B, N, d_model)
+        return context_enc
+
+    def forward(self, x, edge_index, edge_attr_static, return_all_steps=False):
+        """
+        return_all_steps=False: 返回最终预测 (B, pred_len, N, out_channels)
+        return_all_steps=True : 返回 base + 每步 refinement 的中间结果 list（用于深度监督）
+        """
+        B = x.shape[0]
+        N = x.shape[2]
+
+        context_enc = self._encode_context(x, edge_index, edge_attr_static)
+        base_preds = self.base_predictor(context_enc)
+
+        all_preds = [base_preds]
+        traj = base_preds
+        for block in self.refinement_blocks:
+            traj = traj + block(context_enc, traj)
+            all_preds.append(traj)
+
+        def _reshape(p):
+            return p.reshape(B, N, self.pred_len, self.out_channels).permute(0, 2, 1, 3).contiguous()
+
+        if return_all_steps:
+            return [_reshape(p) for p in all_preds]
+        else:
+            return _reshape(all_preds[-1])
+
+
+# ==========================================
+# 4. 训练核心管道
+# ==========================================
+class ForecastingPipeline:
+    def __init__(self, model, config, edge_index, edge_attr_static, physics_idx):
+        self.model = model.to(config['device'])
+        self.config = config
+        self.device = config['device']
+        self.edge_index = edge_index.to(self.device)
+        self.edge_attr_static = edge_attr_static.to(self.device)
+        self.physics_idx = physics_idx
+
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(), lr=config['lr'], weight_decay=1e-2
+        )
+
+        self.use_amp = (self.device.type == 'cuda')
+        self.amp_dtype = torch.bfloat16
+        self.scaler = torch.amp.GradScaler('cuda', enabled=False)
+
+        self.scheduler = ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6
+        )
+
+        self.warmup_steps = int(config.get('warmup_steps', 1000))
+        def warmup_lambda(step):
+            if step < self.warmup_steps:
+                return float(step + 1) / float(self.warmup_steps)
+            return 1.0
+        self.warmup_scheduler = LambdaLR(self.optimizer, lr_lambda=warmup_lambda)
+        self.warmup_step_count = 0
+
+        self.var_weights = torch.tensor(
+            [3.0, 2.0, 1.0, 1.0, 1.0, 0.5], device=self.device
+        ).view(1, 1, 1, -1)
+
+        self.ema = ExponentialMovingAverage(self.model, decay=0.999)
+        self.nan_skip_count = 0
+
+        n_steps = self.model.refinement_steps + 1
+        weights = torch.linspace(0.5, 1.0, n_steps, device=self.device)
+        self.refine_weights = (weights / weights.sum()).tolist()
+        logger.info(f"Refinement 深度监督权重: {[f'{w:.3f}' for w in self.refine_weights]}")
+
+    def _compute_pde_penalty(self, traj, raw_last_x):
+        """弱物理约束: 平流-扩散方程的 1 小时差分残差"""
+        traj = traj.float()
+        raw_last_x = raw_last_x.float()
+        edge_attr_static = self.edge_attr_static.float()
+
+        B, N, pred_len, _ = traj.shape
+        u   = torch.clamp(raw_last_x[:, :, self.physics_idx['u']], -30.0, 30.0)
+        v   = torch.clamp(raw_last_x[:, :, self.physics_idx['v']], -30.0, 30.0)
+        k_z = torch.clamp(raw_last_x[:, :, self.physics_idx['k']], 0.01, 50.0)
+
+        edges_u, edges_v = self.edge_index[0], self.edge_index[1]
+        dx = edge_attr_static[:, 0]
+        dy = edge_attr_static[:, 1]
+        dist = torch.clamp(edge_attr_static[:, 2], min=1000.0)
+
+        v_proj = u[:, edges_u] * dx + v[:, edges_u] * dy
+        v_proj_h = torch.clamp(v_proj, -30.0, 30.0)
+        k_z_h = k_z[:, edges_u]
+
+        T_limit = min(pred_len - 1, 24)
+        traj_clamped = torch.clamp(traj, -100.0, 5000.0)
+        C_t    = traj_clamped[:, :, :T_limit, :]
+        C_next = traj_clamped[:, :, 1:T_limit+1, :]
+
+        dC_dt_25 = (C_next[..., 0] - C_t[..., 0]) / 3600.0
+        dC_dt_10 = (C_next[..., 1] - C_t[..., 1]) / 3600.0
+
+        C_u_25 = C_t[:, edges_u, :, 0]
+        C_v_25 = C_t[:, edges_v, :, 0]
+        C_u_10 = C_t[:, edges_u, :, 1]
+        C_v_10 = C_t[:, edges_v, :, 1]
+
+        v_proj_h_exp = v_proj_h.unsqueeze(-1)
+        k_z_h_exp = k_z_h.unsqueeze(-1)
+        dist_exp = dist.unsqueeze(0).unsqueeze(-1)
+
+        flux_adv_25  = torch.where(v_proj_h_exp > 0, (v_proj_h_exp / dist_exp) * C_u_25, (v_proj_h_exp / dist_exp) * C_v_25)
+        flux_adv_10  = torch.where(v_proj_h_exp > 0, (v_proj_h_exp / dist_exp) * C_u_10, (v_proj_h_exp / dist_exp) * C_v_10)
+        flux_diff_25 = (k_z_h_exp / (dist_exp ** 2)) * (C_u_25 - C_v_25)
+        flux_diff_10 = (k_z_h_exp / (dist_exp ** 2)) * (C_u_10 - C_v_10)
+
+        total_flux_25 = flux_adv_25 + flux_diff_25
+        total_flux_10 = flux_adv_10 + flux_diff_10
+
+        net_flux_25 = torch.zeros_like(dC_dt_25)
+        net_flux_10 = torch.zeros_like(dC_dt_10)
+        edges_v_expand = edges_v.view(1, -1, 1).expand(B, -1, T_limit)
+        edges_u_expand = edges_u.view(1, -1, 1).expand(B, -1, T_limit)
+
+        net_flux_25.scatter_add_(1, edges_v_expand, total_flux_25)
+        net_flux_10.scatter_add_(1, edges_v_expand, total_flux_10)
+        net_flux_25.scatter_add_(1, edges_u_expand, -total_flux_25)
+        net_flux_10.scatter_add_(1, edges_u_expand, -total_flux_10)
+
+        decay_factor = torch.exp(
+            -torch.arange(T_limit, device=traj.device, dtype=torch.float32) / 6.0
+        ).view(1, 1, T_limit)
+        node_penalties_25 = (torch.abs(dC_dt_25 - net_flux_25) * decay_factor).sum(dim=-1)
+        node_penalties_10 = (torch.abs(dC_dt_10 - net_flux_10) * decay_factor).sum(dim=-1)
+        avg_25 = node_penalties_25 / max(1, T_limit)
+        avg_10 = node_penalties_10 / max(1, T_limit)
+        return torch.stack([avg_25, avg_10], dim=-1)
+
+    def _check_finite(self, *tensors):
+        for t in tensors:
+            if not torch.isfinite(t).all():
+                return False
+        return True
+
+    def _train_step(self, batch_x, batch_y, batch_mu, batch_std, raw_last_x):
+        if not self._check_finite(batch_x, batch_y, batch_mu, batch_std, raw_last_x):
+            self.nan_skip_count += 1
+            logger.warning(f"输入含 NaN/Inf，跳过该 step (累计 {self.nan_skip_count})")
+            return float('nan')
+
+        self.optimizer.zero_grad(set_to_none=True)
+
+        with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
+            all_preds = self.model(
+                batch_x, self.edge_index, self.edge_attr_static, return_all_steps=True
+            )
+
+            loss_data = torch.tensor(0.0, device=self.device)
+            for w, pred_k in zip(self.refine_weights, all_preds):
+                step_loss = (F.huber_loss(pred_k, batch_y, reduction='none') * self.var_weights).mean()
+                loss_data = loss_data + w * step_loss
+
+            final_pred = all_preds[-1]
+
+        mu_exp  = batch_mu.unsqueeze(1).float()
+        std_exp = batch_std.unsqueeze(1).float()
+        final_pred_real = final_pred.float() * std_exp + mu_exp
+        final_pred_real = torch.clamp(final_pred_real, -100.0, 5000.0)
+
+        loss_nonneg = F.relu(-final_pred_real).mean() * self.config.get('lambda_nonneg', 0.001)
+
+        phys_warmup = min(1.0, float(self.warmup_step_count) / max(1, self.warmup_steps))
+        lambda_phys = self.config.get('lambda_phys', 0.02) * phys_warmup
+        if lambda_phys > 0:
+            phys_penalty_raw = self._compute_pde_penalty(
+                final_pred_real.permute(0, 2, 1, 3),
+                raw_last_x
+            )
+            std_25_10 = torch.clamp(batch_std[:, :, :2].float(), min=1.0)
+            loss_phys = (phys_penalty_raw / std_25_10).mean() * lambda_phys
+        else:
+            loss_phys = torch.tensor(0.0, device=self.device)
+
+        loss = loss_data + loss_phys + loss_nonneg
+
+        if not torch.isfinite(loss):
+            self.nan_skip_count += 1
+            logger.warning(
+                f"Loss NaN/Inf (data={loss_data.item():.4f}, "
+                f"phys={loss_phys.item():.4f}, nonneg={loss_nonneg.item():.4f})，跳过 (累计 {self.nan_skip_count})"
+            )
+            self.optimizer.zero_grad(set_to_none=True)
+            return float('nan')
+
+        loss.backward()
+
+        grad_finite = True
+        for p in self.model.parameters():
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                grad_finite = False
+                break
+        if not grad_finite:
+            self.nan_skip_count += 1
+            logger.warning(f"梯度 NaN/Inf，跳过 step (累计 {self.nan_skip_count})")
+            self.optimizer.zero_grad(set_to_none=True)
+            return float('nan')
+
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.optimizer.step()
+        self.warmup_scheduler.step()
+        self.warmup_step_count += 1
+        self.ema.update()
+        return loss.item()
+
+    def evaluate_rmse(self, dataloader):
+        self.model.eval()
+        total_se_overall  = 0.0
+        sum_y_overall     = 0.0
+        sum_y2_overall    = 0.0
+        total_count_overall = 0
+        total_phys_loss   = 0.0
+
+        num_vars = len(self.config['target_columns'])
+        total_se_vars  = torch.zeros(num_vars, device=self.device)
+        sum_y_vars     = torch.zeros(num_vars, device=self.device)
+        sum_y2_vars    = torch.zeros(num_vars, device=self.device)
+
+        with torch.no_grad():
+            for x, y, mu, std, raw in dataloader:
+                x, y    = x.to(self.device), y.to(self.device)
+                mu, std = mu.to(self.device), std.to(self.device)
+                raw     = raw.to(self.device)
+
+                preds = self.model(x, self.edge_index, self.edge_attr_static, return_all_steps=False)
+
+                mu_exp  = mu.unsqueeze(1)
+                std_exp = std.unsqueeze(1)
+
+                preds_real = preds.float() * std_exp + mu_exp
+                y_real     = y.float()     * std_exp + mu_exp
+                preds_real = torch.clamp(preds_real, -100.0, 5000.0)
+
+                se = F.mse_loss(preds_real, y_real, reduction='none')
+
+                phys_penalty_raw = self._compute_pde_penalty(
+                    preds_real.permute(0, 2, 1, 3), raw
+                )
+                total_phys_loss += phys_penalty_raw.mean().item() * x.size(0)
+
+                total_se_overall  += se.sum().item()
+                sum_y_overall     += y_real.sum().item()
+                sum_y2_overall    += (y_real ** 2).sum().item()
+                total_count_overall += se.numel()
+
+                total_se_vars  += se.sum(dim=(0, 1, 2))
+                sum_y_vars     += y_real.sum(dim=(0, 1, 2))
+                sum_y2_vars    += (y_real ** 2).sum(dim=(0, 1, 2))
+
+        if total_count_overall == 0:
+            return float("nan"), {}, float("nan"), {}, 0.0
+
+        total_count_vars = total_count_overall / num_vars
+        overall_rmse = float(np.sqrt(total_se_overall / total_count_overall))
+        var_rmses_tensor = torch.sqrt(total_se_vars / total_count_vars).cpu().numpy()
+
+        ss_tot_overall = sum_y2_overall - (sum_y_overall ** 2) / total_count_overall
+        overall_r2 = float(1.0 - (total_se_overall / ss_tot_overall)) if ss_tot_overall != 0 else 0.0
+
+        ss_tot_vars = sum_y2_vars - (sum_y_vars ** 2) / total_count_vars
+        var_r2_tensor = 1.0 - (total_se_vars / ss_tot_vars)
+        var_r2_tensor = torch.where(ss_tot_vars == 0, torch.zeros_like(var_r2_tensor), var_r2_tensor).cpu().numpy()
+
+        var_rmses = {col: float(rmse) for col, rmse in zip(self.config['target_columns'], var_rmses_tensor)}
+        var_r2s   = {col: float(r2)   for col, r2   in zip(self.config['target_columns'], var_r2_tensor)}
+        avg_phys_loss = total_phys_loss / len(dataloader.dataset)
+
+        return overall_rmse, var_rmses, overall_r2, var_r2s, avg_phys_loss
+
+    def train_and_evaluate(self, train_loader, val_loader, save_dir="./save_models"):
+        os.makedirs(save_dir, exist_ok=True)
+        os.makedirs("./logs", exist_ok=True)
+
+        best_val_rmse = float('inf')
+        history = {'train_loss': [], 'val_rmse': [], 'val_r2': [], 'val_phys': []}
+
+        start_epoch = 0
+        ckpt_path = os.path.join(save_dir, "ST_GCN_latest_checkpoint.pth")
+        val_check_steps = 2000
+        patience = 8
+        early_stop_counter = 0
+
+        if os.path.exists(ckpt_path):
+            logger.info(f"恢复检查点: {ckpt_path}")
+            try:
+                checkpoint = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+                self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                if 'optimizer_state_dict' in checkpoint:
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if 'scheduler_state_dict' in checkpoint:
+                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                if 'ema_shadow' in checkpoint:
+                    self.ema.load_state_dict(checkpoint['ema_shadow'])
+                if 'warmup_step_count' in checkpoint:
+                    self.warmup_step_count = checkpoint['warmup_step_count']
+                start_epoch = int(checkpoint.get('epoch', -1)) + 1
+                if 'best_val_rmse' in checkpoint:
+                    best_val_rmse = checkpoint['best_val_rmse']
+            except Exception as e:
+                logger.warning(f"检查点加载失败: {e}，从头开始")
+
+        if start_epoch >= self.config['epochs']:
+            logger.info("已完成所有 epoch，跳过训练阶段。")
+        else:
+            logger.info("=== 开始训练 ===")
+            for epoch in range(start_epoch, self.config['epochs']):
+                self.model.train()
+                epoch_loss = 0.0
+                valid_steps = 0
+
+                pbar = tqdm(
+                    train_loader,
+                    desc=f"Epoch {epoch+1}/{self.config['epochs']}",
+                    mininterval=10.0
+                )
+                for step, (x, y, mu, std, raw) in enumerate(pbar):
+                    loss = self._train_step(
+                        x.to(self.device), y.to(self.device),
+                        mu.to(self.device), std.to(self.device),
+                        raw.to(self.device)
+                    )
+                    if not (np.isnan(loss) or np.isinf(loss)):
+                        epoch_loss += loss
+                        valid_steps += 1
+                    pbar.set_postfix({
+                        'Loss': f"{loss:.4f}",
+                        'NaN_skip': self.nan_skip_count
+                    })
+                    if (step + 1) % val_check_steps == 0:
+                        torch.save({
+                            'epoch': epoch,
+                            'step': step,
+                            'model_state_dict': self.model.state_dict(),
+                            'optimizer_state_dict': self.optimizer.state_dict(),
+                            'scheduler_state_dict': self.scheduler.state_dict(),
+                            'ema_shadow': self.ema.state_dict(),
+                            'warmup_step_count': self.warmup_step_count,
+                            'best_val_rmse': best_val_rmse,
+                        }, ckpt_path)
+
+                avg_loss = epoch_loss / max(1, valid_steps)
+
+                self.ema.apply_shadow()
+                val_rmse_overall, val_rmse_vars, val_r2_overall, val_r2_vars, val_phys = \
+                    self.evaluate_rmse(val_loader)
+                self.ema.restore()
+
+                self.scheduler.step(val_rmse_overall)
+
+                history['train_loss'].append(avg_loss)
+                history['val_rmse'].append(val_rmse_overall)
+                history['val_r2'].append(val_r2_overall)
+                history['val_phys'].append(val_phys)
+
+                logger.info(
+                    f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | "
+                    f"RMSE: {val_rmse_overall:.4f} | R2: {val_r2_overall:.4f} | "
+                    f"Phys: {val_phys:.4f} | NaN_skip: {self.nan_skip_count}"
+                )
+                for k in val_rmse_vars:
+                    logger.info(f"  {k}: RMSE={val_rmse_vars[k]:.2f}, R2={val_r2_vars[k]:.3f}")
+
+                if val_rmse_overall < best_val_rmse:
+                    best_val_rmse = val_rmse_overall
+                    early_stop_counter = 0
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': self.model.state_dict(),
+                        'optimizer_state_dict': self.optimizer.state_dict(),
+                        'best_val_rmse': best_val_rmse,
+                        'ema_shadow': self.ema.state_dict(),
+                    }, os.path.join(save_dir, "ST_GCN_best.pth"))
+                    logger.info(f"🏆 最优模型已保存 (RMSE={best_val_rmse:.4f})")
+                else:
+                    early_stop_counter += 1
+                    if early_stop_counter >= patience:
+                        logger.info(f"早停触发 (patience={patience})")
+                        break
+
+            torch.save({
+                'epoch': self.config['epochs'],
+                'completion': True,
+                'best_val_rmse': best_val_rmse,
+            }, ckpt_path)
+
+        self.plot_training_curves(history)
+        return history
+
+    def plot_training_curves(self, history, save_dir="./logs"):
+        os.makedirs(save_dir, exist_ok=True)
+        if len(history.get('train_loss', [])) == 0:
+            logger.info("无训练历史可绘制。")
+            return
+
+        plt.figure(figsize=(14, 5))
+        plt.subplot(1, 2, 1)
+        ax1, ax2 = plt.gca(), plt.gca().twinx()
+        ax1.plot(history['train_loss'], 'b-', label='Train Loss')
+        ax2.plot(history['val_rmse'],   'r--', label='Val RMSE')
+        ax1.set_xlabel('Epochs')
+        ax1.set_ylabel('Loss', color='b')
+        ax2.set_ylabel('RMSE', color='r')
+        plt.title('Loss & RMSE')
+        ax1.legend(loc='upper left')
+        ax2.legend(loc='upper right')
+
+        plt.subplot(1, 2, 2)
+        ax1, ax2 = plt.gca(), plt.gca().twinx()
+        ax1.plot(history['val_r2'], 'g-', label='Val R²')
+        ax2.plot(history['val_phys'], 'm--', label='Val Phys Loss')
+        ax1.set_xlabel('Epochs')
+        ax1.set_ylabel('R²', color='g')
+        ax2.set_ylabel('Phys Loss', color='m')
+        plt.title('R² & Physics Penalty')
+        ax1.legend(loc='upper left')
+        ax2.legend(loc='upper right')
+
+        plt.tight_layout()
+        plot_path = os.path.join(save_dir, f"training_curve_{datetime.now().strftime('%Y%m%d_%H%M')}.png")
+        plt.savefig(plot_path, dpi=300)
+        logger.info(f"训练曲线已保存至: {plot_path}")
+        plt.close()
+
+
+# ==========================================
+# 5. 主执行入口模块
+# ==========================================
+def main():
+    set_deterministic_environment(42)
+
+    pipeline = DataIngestionPipeline(
+        station_dirs=[f"/home/lcy/data/全国空气质量/站点_{yr}0101-{yr}1231" for yr in range(2016, 2026)],
+        station_meta_path="/home/lcy/data/全国空气质量/site.xlsx",
+        era5_dir="/home/lcy/data/era5",
+        modis_dir="/home/lcy/data/MODIS",
+        himawari_dir="/home/lcy/data/himawari_L3031/031"
+    )
+
+    target_columns = ['PM2.5', 'PM10', 'NO2', 'SO2', 'O3', 'CO']
+    pipeline.process_and_cache(target_cols=target_columns)
+
+    sample_feat = np.load(pipeline.features_cache)
+    sample_targ = np.load(pipeline.targets_cache)
+
+    if not np.isfinite(sample_feat).all():
+        logger.warning("sample_feat 含 NaN/Inf，强制清洗")
+        sample_feat = np.nan_to_num(sample_feat, nan=0.0, posinf=0.0, neginf=0.0)
+    if not np.isfinite(sample_targ).all():
+        logger.warning("sample_targ 含 NaN/Inf，强制清洗")
+        sample_targ = np.nan_to_num(sample_targ, nan=0.0, posinf=0.0, neginf=0.0)
+
+    edge_index, edge_attr_static = pipeline.build_physics_geographic_graph(
+        radius_km=100.0, max_neighbors=8
+    )
+
+    config = {
+        'seq_len': 336,
+        'pred_len': 72,
+        'd_model': 192,
+        'dropout': 0.3,
+        'batch_size': 4,
+        'lr': 3e-5,
+        'lambda_phys': 0.02,
+        'lambda_nonneg': 0.001,
+        'epochs': 40,
+        'device': device,
+        'target_columns': target_columns,
+        'refinement_steps': 3,
+        'warmup_steps': 1000,
+    }
+
+    total_time_steps = sample_feat.shape[0]
+    train_end = int(total_time_steps * 0.7)
+    val_end   = int(total_time_steps * 0.8)
+
+    train_feat = sample_feat[:train_end]
+    global_mu  = np.mean(train_feat, axis=0)
+    global_std = np.std(train_feat,  axis=0)
+
+    global_mu  = np.where(np.isfinite(global_mu),  global_mu,  0.0).astype(np.float32)
+    global_std = np.where(np.isfinite(global_std), global_std, 1.0).astype(np.float32)
+    global_std = np.where(global_std < 1e-2, 1.0, global_std)
+
+    assert global_mu.shape  == (sample_feat.shape[1], sample_feat.shape[2])
+    assert global_std.shape == global_mu.shape
+    assert np.isfinite(global_mu).all()
+    assert np.isfinite(global_std).all()
+    assert (global_std > 0).all()
+    logger.info(f"全局统计 shape: mu={global_mu.shape}, std={global_std.shape}")
+    logger.info(f"std 范围: [{global_std.min():.4f}, {global_std.max():.4f}]")
+    logger.info(f"mu 范围:  [{global_mu.min():.4f}, {global_mu.max():.4f}]")
+
+    val_start_idx  = max(0, train_end - config['seq_len'])
+    test_start_idx = max(0, val_end   - config['seq_len'])
+
+    train_dataset = LocalDiskDataset(sample_feat, sample_targ, config['seq_len'], config['pred_len'],
+                                     global_mu, global_std, 0, train_end)
+    val_dataset   = LocalDiskDataset(sample_feat, sample_targ, config['seq_len'], config['pred_len'],
+                                     global_mu, global_std, val_start_idx, val_end)
+    test_dataset  = LocalDiskDataset(sample_feat, sample_targ, config['seq_len'], config['pred_len'],
+                                     global_mu, global_std, test_start_idx, total_time_steps)
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=config['batch_size'], shuffle=True, drop_last=True,
+        num_workers=min(os.cpu_count() or 8, 12), pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=config['batch_size'], shuffle=False, drop_last=False,
+        num_workers=min(os.cpu_count() or 4, 4), pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=config['batch_size'], shuffle=False, drop_last=False,
+        num_workers=min(os.cpu_count() or 4, 4), pin_memory=True
+    )
+
+    model = ST_GCN_iTransformer(
+        num_nodes       = int(sample_feat.shape[1]),
+        in_features     = int(sample_feat.shape[-1]),
+        seq_len         = config['seq_len'],
+        pred_len        = config['pred_len'],
+        out_channels    = int(sample_targ.shape[-1]),
+        physics_indices = pipeline.physics_indices,
+        d_model         = config['d_model'],
+        dropout         = config['dropout'],
+        refinement_steps= config['refinement_steps']
+    ).to(config['device'])
+
+    n_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"模型参数量: {n_params/1e6:.2f}M")
+
+    trainer = ForecastingPipeline(model, config, edge_index, edge_attr_static, pipeline.physics_indices)
+    trainer.train_and_evaluate(train_loader, val_loader, save_dir="./save_models")
+
+    logger.info("\n=== 阶段二: 测试集评估 ===")
+    best_path = os.path.join("./save_models", "ST_GCN_best.pth")
+    if os.path.exists(best_path):
+        checkpoint = torch.load(best_path, map_location=config['device'], weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        if 'ema_shadow' in checkpoint:
+            trainer.ema.load_state_dict(checkpoint['ema_shadow'])
+            trainer.ema.apply_shadow()
+        model.eval()
+        test_rmse, test_rmse_v, test_r2, test_r2_v, test_phys = trainer.evaluate_rmse(test_loader)
+        logger.info(f"测试结果 | RMSE: {test_rmse:.4f}, R2: {test_r2:.4f}, Phys: {test_phys:.4f}")
+        for k in test_rmse_v:
+            logger.info(f"  {k}: RMSE={test_rmse_v[k]:.2f}, R2={test_r2_v[k]:.3f}")
+        if 'ema_shadow' in checkpoint:
+            trainer.ema.restore()
+    else:
+        logger.warning("未找到最佳模型，测试评估取消。")
+
+
+if __name__ == '__main__':
+    mp.freeze_support()
+    main()
